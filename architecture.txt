@@ -1,0 +1,29 @@
+AUTHENTICATION V0.1
+
+DEPLOYMENT-OWNED VERIFICATION MATERIAL
+ password records / TOTP secrets / pinned OIDC key / passkey keys
+                    |
+                    v
++--------------------------------------------------+
+| authcheck / internal/authn                       |
+|                                                  |
+| validate configuration security floors          |
+|                                                  |
+| local      -> PBKDF2-HMAC-SHA256 verify          |
+| totp       -> RFC 6238 six-digit verify          |
+| oidc       -> isolate gate -> pinned RS256 verify|
+| passkey    -> WebAuthn assertion verify          |
+| breakglass -> exactly two registered credentials |
++----------------------+---------------------------+
+                       |
+                       v
+            AUTHENTICATED / DENIED
+            + passkey counter/warning
+
+NO NETWORK CLIENT
+NO USER/SESSION STORE
+NO ENROLMENT/REGISTRATION
+NO RATE LIMITER
+NO JWKS/DISCOVERY
+
+Rule: Verify credentials. Do not become the identity platform.
