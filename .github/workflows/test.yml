@@ -1,0 +1,39 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests with race detector
+        run: go test -race ./...
+      - name: Build
+        run: go build -o ./bin/authcheck ./cmd/authcheck
+      - name: Version contract
+        run: test "$(./bin/authcheck -version)" = "authcheck 0.1.0"
+      - name: Linux arm64 build
+        run: GOOS=linux GOARCH=arm64 go build -o ./bin/authcheck-linux-arm64 ./cmd/authcheck
+      - name: Bafflewick CLI acceptance
+        shell: bash
+        run: |
+          local_out=$(./bin/authcheck -config examples/bafflewick/config.json -request examples/bafflewick/local-request.json)
+          echo "$local_out" | grep -q '"authenticated":true'
+          echo "$local_out" | grep -q 'major-alex'
+          bg_out=$(./bin/authcheck -config examples/bafflewick/config.json -request examples/bafflewick/break-glass-request.json)
+          echo "$bg_out" | grep -q '"authenticated":true'
+          echo "$bg_out" | grep -q 'major-alex'
+          echo "$bg_out" | grep -q 'major-sam'
+      - name: Cryptographic boundary acceptance
+        run: go test ./internal/authn -run 'TestTOTP|TestIsolateRejectsOIDC|TestOIDC|TestPasskey|TestPasskeyRejectsWrongOrigin|TestOIDCRejectsBadClaims|TestIsolateLeavesLocalAndBreakGlassAvailable' -count=1
