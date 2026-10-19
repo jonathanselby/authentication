@@ -6,7 +6,7 @@
 
 `authentication` is a deliberately small Go verification component for applications that need several authentication paths but want enrolment, credential custody, sessions and identity lifecycle to remain elsewhere.
 
-V0.1 verifies five paths: local PBKDF2 password records, RFC 6238 TOTP, pinned-key OIDC ID tokens, pre-registered WebAuthn/passkey assertions, and two-person break-glass credentials. It is independently usable; CRAB is one consumer, not part of the component contract.
+V0.1 verifies five paths: local PBKDF2 password records, RFC 6238 TOTP, pinned-key OIDC ID tokens, pre-registered WebAuthn/passkey assertions, and two-person break-glass credentials.
 
 ## What V0.1 proves
 
