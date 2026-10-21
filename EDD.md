@@ -1,237 +1,114 @@
 # Authentication — Engineering Design Document
 
-**Version:** 0.1
+**Version:** 0.1  
+**Reviewed:** 2026-10-22
 
 ## 1. Purpose
 
-Authentication verifies already-enrolled authentication material for a small application while deliberately leaving identity lifecycle and session state outside the component.
+Authentication verifies already-enrolled credentials without becoming an identity platform.
 
-> **Verify credentials. Do not become the identity platform.**
+> **Verify credentials. Keep ceremony state outside untrusted requests.**
 
-## 2. Design constraints
+The component remains local and deterministic: no identity database, session store, OIDC discovery or outbound network dependency.
 
-1. Verification only: no enrolment, issuance, recovery or session management.
-2. Local deterministic boundary: no OIDC discovery/JWKS network dependency.
-3. Standards before invention: use standard-library cryptography and explicit protocol subsets.
-4. Denial is not failure: bad credentials return a structured unauthenticated result; bad configuration/input is an execution error.
-5. Security floors are configuration invariants, not caller suggestions.
+## 2. Trust boundary
 
-## 3. Component model
+Authentication has three inputs:
 
-```text
-configuration + authentication attempt
-                 |
-                 v
-+----------------------------------+
-| cmd/authcheck                    |
-| file input / version / exit code |
-+----------------+-----------------+
-                 |
-                 v
-+----------------------------------+
-| internal/authn                   |
-| ValidateConfig -> Authenticate   |
-+---+---------+------+-------+-----+
-    |         |      |       |
- password   TOTP    OIDC   passkey   breakglass
-```
+1. `Config` — registered verification material and static policy;
+2. `Request` — credentials presented by the claimant;
+3. `TrustedContext` — ceremony state supplied by the integrating application.
 
-There is no network client or persistent store in the package.
+`Request` contains method, user ID and the presented password/TOTP/OIDC token/passkey assertion/break-glass secrets. It cannot supply current time, expected OIDC nonce, expected WebAuthn challenge or isolate-mode state.
 
-## 4. Configuration model
+`TrustedContext` carries those four security-sensitive values. If `Now` is zero, `Authenticate` uses the process UTC clock. This is deliberately not a session store: challenge/nonce generation and persistence remain outside this component.
 
-`Config` may contain local password records, TOTP records, one pinned-key OIDC verifier, passkey records and break-glass records.
+## 3. Configuration validation
 
-`ValidateConfig` checks method-local duplicate user IDs and validates stored verification material before a request is evaluated. A user may legitimately have more than one authentication method; duplicate IDs are prohibited only within the same record set.
+`ValidateConfig` runs before authentication. It validates stored password/TOTP/OIDC/passkey/break-glass material and rejects duplicate records within each authentication method. A person may still have multiple different authentication methods.
 
-OIDC configuration requires issuer, primary audience/client ID and pinned RSA public key. Additional trusted audiences and bounded clock skew are optional.
+Break-glass duplicate keyholder IDs are rejected at configuration time as well as by the verifier.
 
-Passkey configuration holds RP ID, exact origin, P-256 public key, optional UV requirement and last persisted signature counter supplied by the consuming application.
+## 4. Local passwords
 
-## 5. Authentication result model
-
-`Result` contains:
-
-- `authenticated`;
-- subject;
-- method;
-- two break-glass keyholder IDs where applicable;
-- observed passkey signature counter;
-- `counter_warning`;
-- a generic reason.
-
-Cryptographic verifier functions may return detailed errors for tests/integration, but `Authenticate` maps credential failures to generic denial to avoid exposing verifier detail through the normal application boundary.
-
-## 6. Local password verification
-
-`PBKDF2Record` and `VerifyPassword` use Go 1.26 `crypto/pbkdf2` with HMAC-SHA256.
-
-Security floor:
+PBKDF2-HMAC-SHA256 uses:
 
 ```text
-iterations >= 600000
+600000 <= iterations <= 2000000
 salt >= 16 bytes
 hash = 32 bytes
 ```
 
-Salt/hash storage is base64. Hash comparison uses `subtle.ConstantTimeCompare`.
+The upper bound prevents hostile or corrupt configuration from causing unbounded CPU work. Stored hash comparison is constant time.
 
-The component does not generate salts, choose passwords, rate-limit attempts, use a pepper or store records.
+For an unknown local user, authentication performs one valid minimum-cost dummy PBKDF2 check before returning the same generic denial. This removes the obvious zero-work username path; application-level rate limiting remains out of scope.
 
-## 7. TOTP verification
+## 5. TOTP
 
-TOTP uses a 30-second moving counter and HMAC-SHA1 dynamic truncation compatible with RFC 6238.
+TOTP is six decimal digits, HMAC-SHA1 dynamic truncation, 30-second steps and a configurable window of 0..2. Secrets must decode to at least 20 bytes.
 
-Validation requires:
+Time comes from `TrustedContext` or the system clock, never credential request JSON.
 
-- six decimal digits;
-- base32 secret decoding to at least 20 bytes;
-- time not before Unix epoch;
-- acceptance window from zero to two steps.
+## 6. Pinned-key OIDC
 
-Candidate comparison uses constant-time byte comparison.
+OIDC remains deliberately small: RS256 only, pinned RSA public key >=2048 bits, no discovery/JWKS network client.
 
-Replay prevention is outside V0.1 because it requires request/session state.
+After signature verification it checks exact issuer, non-empty subject, configured audience, trusted additional audiences, `azp` rules, optional expected nonce, expiry and optional `nbf` with bounded clock skew.
 
-## 8. OIDC verification
+Expected nonce, current time and isolate-mode state come from `TrustedContext`. Isolate mode denies OIDC before token verification.
 
-OIDC is deliberately pinned-key rather than discovery based.
+## 7. Passkeys
 
-`VerifyOIDC`:
+V0.1 verifies assertions for registered ECDSA P-256 credentials.
 
-1. validates static OIDC configuration;
-2. requires a three-part JWT and header algorithm `RS256`;
-3. parses payload structure;
-4. verifies the JWT signature with the configured RSA public key (minimum 2048 bits);
-5. only after signature success evaluates identity claims;
-6. requires exact issuer and non-empty subject;
-7. requires the configured primary audience;
-8. permits additional audiences only when explicitly trusted;
-9. requires `azp` for multiple audiences and requires any present `azp` to equal the primary audience/client ID;
-10. checks expected nonce when supplied by the caller;
-11. checks `exp` and optional `nbf` with configured clock skew bounded to 0..300 seconds.
-
-Isolate mode is evaluated before calling `VerifyOIDC`; no federation network client exists in the component.
-
-## 9. WebAuthn/passkey verification
-
-V0.1 verifies assertions only for already-registered ECDSA P-256 credentials.
-
-`clientDataJSON` validation requires:
+`VerifyPasskey` receives the expected challenge separately from the assertion. It checks:
 
 - `type == webauthn.get`;
-- exact expected challenge string;
-- exact configured origin;
-- `crossOrigin != true`.
+- client-data challenge equals the trusted expected challenge;
+- exact configured origin and no cross-origin assertion;
+- RP ID hash;
+- User Presence and optional User Verification flags;
+- ECDSA P-256 signature over `authenticatorData || SHA256(clientDataJSON)`.
 
-Authenticator-data validation requires:
+The assertion can no longer nominate the value against which its own challenge is accepted.
 
-- at least 37 bytes;
-- SHA-256 RP ID hash match;
-- User Presence flag;
-- User Verification flag when the credential record requires it.
+The observed signature counter is returned. A non-increasing non-zero counter remains a warning rather than an automatic rejection because counter persistence/risk policy belongs to the relying application.
 
-The signature is verified over:
+## 8. Break-glass
+
+Exactly two distinct registered keyholder credentials must verify together. Their password records use the same bounded PBKDF2 rules as local authentication. Returned IDs are sorted for deterministic output.
+
+The component verifies credentials only; it does not grant emergency authority or coordinate the two humans.
+
+## 9. CLI boundary
+
+`authcheck` reads configuration and credential request JSON from files. Trusted ceremony values are separate CLI inputs:
 
 ```text
-authenticatorData || SHA256(clientDataJSON)
+-oidc-nonce
+-passkey-challenge
+-isolate
 ```
 
-using ECDSA P-256/SHA-256.
+Authentication time is taken from the process clock. No request-file `now`, nonce, challenge or isolate flag is trusted.
 
-The observed 32-bit signature counter is returned. If either stored or observed counter is non-zero and the observed value does not increase, the result carries a warning. V0.1 deliberately leaves persistence and risk response to the application.
-
-## 10. Break-glass verification
-
-Break-glass accepts exactly two map entries, therefore two distinct keyholder IDs by construction. Each ID must match a registered break-glass record and each supplied secret must pass the same PBKDF2 record verification used for local authentication.
-
-Returned keyholder IDs are sorted to make output deterministic.
-
-The component does not coordinate two humans or grant application authority; it only verifies the two registered secrets presented together.
-
-## 11. Isolate mode
-
-`Request.IsolateMode` affects only the OIDC path. OIDC returns a deterministic unauthenticated result before token verification.
-
-Local password, TOTP, passkey and break-glass paths are locally verifiable and remain available if configured.
-
-V0.1 has no hidden online dependency, so isolate-mode correctness does not depend on mocking or suppressing a network client.
-
-## 12. Failure and exit semantics
-
-`Authenticate` returns an error for invalid configuration but returns `Authenticated=false` for bad credentials or unsupported authentication methods.
-
-CLI mapping:
+Exit codes remain:
 
 | Exit | Meaning |
 |---:|---|
 | 0 | authentication succeeded |
-| 1 | deterministic authentication denial |
+| 1 | authentication denied |
 | 2 | CLI usage error |
-| 3 | malformed configuration/request or execution error |
+| 3 | configuration/input/execution error |
 
-The CLI validates configuration before authentication.
+## 10. Tests and evidence
 
-## 13. Secret and key boundary
+Automated tests cover password lower/upper bounds, known/unknown-user generic denial, TOTP boundaries, pinned OIDC claims and trusted context, passkey challenge/UP/UV/origin/signature/counter behaviour, duplicate break-glass configuration and deterministic break-glass output.
 
-This repository consumes verification material; it does not provide a secret store.
+CI remains authoritative for this Go 1.26 module and runs `gofmt`, `go vet`, race tests, native build, version contract, `linux/arm64` build and the Bafflewick acceptance subset.
 
-Sensitive deployment-owned values can include password hashes/salts, TOTP secrets, break-glass hashes, OIDC public keys and passkey public keys/counters. Public keys are not secret, but their binding to the correct issuer/user/credential is security-sensitive.
+## 11. Deliberate limits
 
-V0.1 contains no password plaintext persistence, private asymmetric key custody or outbound secret transmission.
+V0.1 still does not implement enrolment, password policy/reset, rate limiting, TOTP replay storage, OIDC discovery/JWKS rotation, OAuth flows, WebAuthn registration/attestation, credential persistence, passkey counter persistence, sessions, account recovery or key custody.
 
-## 14. Testing strategy
-
-Tests use generated ephemeral RSA/P-256 keys and deterministic password/TOTP fixtures.
-
-Coverage includes:
-
-- PBKDF2 success/failure and security floors;
-- RFC 6238 six-digit vector, short secret and window/code boundaries;
-- pinned OIDC success, multiple audience trust/`azp`, nonce/time bounds and isolate refusal;
-- passkey signature, UP/UV, cross-origin refusal and counter warning;
-- deterministic two-person break-glass output;
-- generic denial semantics;
-- configuration rejection.
-
-No live IdP, authenticator or secret store is required for the executable V0.1 evidence.
-
-## 15. Build and dependency boundary
-
-The module targets Go 1.26. Cryptographic primitives use the Go standard library, including `crypto/pbkdf2`, RSA, ECDSA, HMAC/SHA-1 for RFC 6238 and SHA-256.
-
-CI runs format, vet, race tests, native build, exact version assertion, `linux/arm64` cross-build and the Bafflewick authentication suite.
-
-## 16. Known limits
-
-- no enrolment or credential lifecycle;
-- no password policy, reset or guess throttling;
-- no TOTP replay state;
-- no OIDC discovery, JWKS fetch/rotation, OAuth flow or token exchange;
-- one pinned OIDC RSA key/config at a time;
-- no WebAuthn registration/attestation or authenticator metadata;
-- passkey counter state is supplied/persisted by the caller;
-- no session/cookie/token issuance;
-- no account recovery;
-- no constrained-hardware runtime benchmark in V0.1, only ARM64 buildability.
-
-## 17. Acceptance-to-evidence map
-
-| PRD criterion | Executable evidence |
-|---|---|
-| local password + bad password | `TestLocalAndBreakGlass` |
-| PBKDF2 floors | `TestPasswordFloors` |
-| RFC 6238 vector/code/window | `TestTOTP` |
-| short TOTP secret | `TestTOTPRejectsShortSecret` |
-| valid pinned OIDC | `TestOIDC` |
-| audience trust + `azp` | `TestOIDCMultipleAudienceRequiresAZPAndTrust` |
-| nonce/time bounds | `TestOIDCNonceAndTimeBounds` |
-| isolate OIDC denial | `TestIsolateRejectsOIDC` |
-| passkey UP+UV/signature/counter | `TestPasskey` |
-| required UV | `TestPasskeyRequiresUVWhenConfigured` |
-| counter warning + cross-origin refusal | `TestPasskeyCounterWarningAndCrossOriginRefusal` |
-| generic denial | `TestAuthenticateReturnsGenericDenial` |
-| invalid config | `TestValidateConfig` |
-| Go/race/build/ARM64/Bafflewick | `.github/workflows/test.yml` |
-
-`generated/EDD.md` is separately recovered from the source commit and must not be produced by copying this design document.
+These omissions are boundaries, not invitations to recreate an identity platform inside this component.

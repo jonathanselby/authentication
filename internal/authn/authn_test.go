@@ -47,6 +47,9 @@ func TestPasswordFloors(t *testing.T) {
 	if _, err := PBKDF2Record("u", "secret", []byte("1234567890123456"), MinPBKDF2Iterations-1); err == nil {
 		t.Fatal("weak work factor accepted")
 	}
+	if _, err := PBKDF2Record("u", "secret", []byte("1234567890123456"), MaxPBKDF2Iterations+1); err == nil {
+		t.Fatal("excessive work factor accepted")
+	}
 }
 
 func TestTOTP(t *testing.T) {
@@ -87,7 +90,7 @@ func rsaFixture(t *testing.T) (*rsa.PrivateKey, string) {
 
 func oidcToken(t *testing.T, priv *rsa.PrivateKey, claims map[string]any) string {
 	t.Helper()
-	h := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	h := base64.RawURLEncoding.EncodeToString([]byte("{\"alg\":\"RS256\",\"typ\":\"JWT\"}"))
 	cb, err := json.Marshal(claims)
 	if err != nil {
 		t.Fatal(err)
@@ -147,16 +150,31 @@ func TestOIDCNonceAndTimeBounds(t *testing.T) {
 	}
 }
 
+func TestAuthenticateUsesTrustedOIDCContext(t *testing.T) {
+	priv, pub := rsaFixture(t)
+	now := time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC)
+	cfg := Config{OIDC: &OIDCConfig{Issuer: "issuer", Audience: "client", PublicKeyPEM: pub}}
+	tok := oidcToken(t, priv, map[string]any{"iss": "issuer", "aud": "client", "sub": "sam", "exp": now.Add(time.Hour).Unix(), "nonce": "trusted"})
+	res, err := Authenticate(cfg, Request{Method: "oidc", OIDCToken: tok}, TrustedContext{Now: now, OIDCNonce: "trusted"})
+	if err != nil || !res.Authenticated || res.Subject != "sam" {
+		t.Fatalf("trusted OIDC context rejected: %+v %v", res, err)
+	}
+	res, err = Authenticate(cfg, Request{Method: "oidc", OIDCToken: tok}, TrustedContext{Now: now, OIDCNonce: "wrong"})
+	if err != nil || res.Authenticated {
+		t.Fatalf("wrong trusted nonce accepted: %+v %v", res, err)
+	}
+}
+
 func TestIsolateRejectsOIDC(t *testing.T) {
 	_, pub := rsaFixture(t)
 	cfg := Config{OIDC: &OIDCConfig{Issuer: "issuer", Audience: "client", PublicKeyPEM: pub}}
-	r, err := Authenticate(cfg, Request{Method: "oidc", IsolateMode: true, OIDCToken: "not-even-a-token"})
+	r, err := Authenticate(cfg, Request{Method: "oidc", OIDCToken: "not-even-a-token"}, TrustedContext{IsolateMode: true})
 	if err != nil || r.Authenticated || r.Reason != "federation disabled in isolate mode" {
 		t.Fatalf("%+v %v", r, err)
 	}
 }
 
-func passkeyFixture(t *testing.T, requireUV bool, flags byte, storedCount, newCount uint32, crossOrigin bool) (PasskeyRecord, PasskeyAssertion) {
+func passkeyFixture(t *testing.T, requireUV bool, flags byte, storedCount, newCount uint32, crossOrigin bool) (PasskeyRecord, PasskeyAssertion, string) {
 	t.Helper()
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -181,33 +199,61 @@ func passkeyFixture(t *testing.T, requireUV bool, flags byte, storedCount, newCo
 	if err != nil {
 		t.Fatal(err)
 	}
-	return PasskeyRecord{UserID: "u", RPID: "crab.local", Origin: "https://crab.local", PublicKeyPEM: pub, RequireUserVerification: requireUV, SignCount: storedCount}, PasskeyAssertion{ClientDataJSON: base64.RawURLEncoding.EncodeToString(cd), AuthenticatorData: base64.RawURLEncoding.EncodeToString(ad), Signature: base64.RawURLEncoding.EncodeToString(sig), Challenge: challenge}
+	return PasskeyRecord{
+			UserID:                  "u",
+			RPID:                    "crab.local",
+			Origin:                  "https://crab.local",
+			PublicKeyPEM:            pub,
+			RequireUserVerification: requireUV,
+			SignCount:               storedCount,
+		}, PasskeyAssertion{
+			ClientDataJSON:    base64.RawURLEncoding.EncodeToString(cd),
+			AuthenticatorData: base64.RawURLEncoding.EncodeToString(ad),
+			Signature:         base64.RawURLEncoding.EncodeToString(sig),
+		}, challenge
 }
 
 func TestPasskey(t *testing.T) {
-	r, a := passkeyFixture(t, true, 0x05, 4, 5, false)
-	v, err := VerifyPasskey(r, a)
+	r, a, challenge := passkeyFixture(t, true, 0x05, 4, 5, false)
+	v, err := VerifyPasskey(r, a, challenge)
 	if err != nil || v.SignCount != 5 || v.CounterWarning {
 		t.Fatalf("passkey verification: %+v %v", v, err)
+	}
+	if _, err := VerifyPasskey(r, a, "attacker-chosen"); err == nil {
+		t.Fatal("assertion accepted against wrong trusted challenge")
 	}
 }
 
 func TestPasskeyRequiresUVWhenConfigured(t *testing.T) {
-	r, a := passkeyFixture(t, true, 0x01, 0, 1, false)
-	if _, err := VerifyPasskey(r, a); err == nil {
+	r, a, challenge := passkeyFixture(t, true, 0x01, 0, 1, false)
+	if _, err := VerifyPasskey(r, a, challenge); err == nil {
 		t.Fatal("passkey without UV accepted when UV required")
 	}
 }
 
 func TestPasskeyCounterWarningAndCrossOriginRefusal(t *testing.T) {
-	r, a := passkeyFixture(t, false, 0x01, 5, 5, false)
-	v, err := VerifyPasskey(r, a)
+	r, a, challenge := passkeyFixture(t, false, 0x01, 5, 5, false)
+	v, err := VerifyPasskey(r, a, challenge)
 	if err != nil || !v.CounterWarning {
 		t.Fatalf("expected counter warning: %+v %v", v, err)
 	}
-	r, a = passkeyFixture(t, false, 0x01, 0, 1, true)
-	if _, err := VerifyPasskey(r, a); err == nil {
+	r, a, challenge = passkeyFixture(t, false, 0x01, 0, 1, true)
+	if _, err := VerifyPasskey(r, a, challenge); err == nil {
 		t.Fatal("cross-origin assertion accepted")
+	}
+}
+
+func TestAuthenticatePasskeyRequiresTrustedChallenge(t *testing.T) {
+	r, a, challenge := passkeyFixture(t, false, 0x01, 0, 1, false)
+	cfg := Config{Passkeys: []PasskeyRecord{r}}
+	req := Request{Method: "passkey", UserID: "u", Passkey: &a}
+	res, err := Authenticate(cfg, req, TrustedContext{})
+	if err != nil || res.Authenticated {
+		t.Fatalf("passkey authenticated without trusted challenge: %+v %v", res, err)
+	}
+	res, err = Authenticate(cfg, req, TrustedContext{PasskeyChallenge: challenge})
+	if err != nil || !res.Authenticated {
+		t.Fatalf("passkey rejected with trusted challenge: %+v %v", res, err)
 	}
 }
 
@@ -216,11 +262,16 @@ func TestAuthenticateReturnsGenericDenial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := Authenticate(Config{Local: []PasswordRecord{p}}, Request{Method: "local", UserID: "u", Password: "wrong"})
+	cfg := Config{Local: []PasswordRecord{p}}
+	res, err := Authenticate(cfg, Request{Method: "local", UserID: "u", Password: "wrong"}, TrustedContext{})
 	if err != nil || res.Authenticated || res.Reason != "credentials rejected" {
 		t.Fatalf("unexpected denial: %+v %v", res, err)
 	}
-	res, err = Authenticate(Config{Local: []PasswordRecord{p}}, Request{Method: "nope"})
+	res, err = Authenticate(cfg, Request{Method: "local", UserID: "not-a-user", Password: "wrong"}, TrustedContext{})
+	if err != nil || res.Authenticated || res.Reason != "credentials rejected" {
+		t.Fatalf("unknown user denial leaked detail: %+v %v", res, err)
+	}
+	res, err = Authenticate(cfg, Request{Method: "nope"}, TrustedContext{})
 	if err != nil || res.Authenticated || !strings.Contains(res.Reason, "unsupported") {
 		t.Fatalf("unsupported method not a deterministic denial: %+v %v", res, err)
 	}
@@ -238,5 +289,18 @@ func TestValidateConfig(t *testing.T) {
 	bad.Iterations = MinPBKDF2Iterations - 1
 	if err := ValidateConfig(Config{Local: []PasswordRecord{bad}}); err == nil {
 		t.Fatal("weak password record accepted")
+	}
+	bad = p
+	bad.Iterations = MaxPBKDF2Iterations + 1
+	if err := ValidateConfig(Config{Local: []PasswordRecord{bad}}); err == nil {
+		t.Fatal("excessive password work factor accepted")
+	}
+
+	a, err := BreakGlassFromPassword("a", "KEYA", []byte("aaaaaaaaaaaaaaaa"), MinPBKDF2Iterations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateConfig(Config{BreakGlass: []BreakGlassRecord{a, a}}); err == nil {
+		t.Fatal("duplicate break-glass keyholder accepted")
 	}
 }

@@ -1,23 +1,34 @@
 # Authentication — Verification Protocol Boundary
 
 **Component version:** 0.1.0  
-**Reviewed:** 2026-10-17
+**Reviewed:** 2026-10-22
 
 This file defines what the component verifies and, equally importantly, what it deliberately leaves to the surrounding identity/application platform.
+
+## Trust boundary
+
+Credential request JSON contains only material presented for authentication. Security-sensitive ceremony state is supplied separately as `TrustedContext` by the integrating application or CLI boundary:
+
+- current time (or the component's system clock when omitted);
+- expected OIDC nonce;
+- expected WebAuthn challenge;
+- isolate-mode state.
+
+The credential request cannot choose those values.
 
 ## Local password records
 
 V0.1 supports PBKDF2-HMAC-SHA256 only.
 
-Security floor:
+Security bounds:
 
 ```text
-iterations >= 600000
+600000 <= iterations <= 2000000
 salt length >= 16 bytes
 derived hash = 32 bytes
 ```
 
-Go 1.26 `crypto/pbkdf2` performs derivation. Stored hashes and comparisons use base64 plus constant-time comparison. The component verifies records; it does not generate random salts, change passwords, enforce password policy, rate-limit guesses or store a pepper.
+Go 1.26 `crypto/pbkdf2` performs derivation. Stored hashes and comparisons use base64 plus constant-time comparison. Unknown local user IDs still execute one minimum-cost PBKDF2 verification before the same generic denial is returned, avoiding an obvious fast-path username oracle. The component verifies records; it does not generate random salts, change passwords, enforce password policy, rate-limit guesses or store a pepper.
 
 ## TOTP
 
@@ -30,6 +41,8 @@ base32 secret decodes to >= 20 bytes
 code is exactly six decimal digits
 window is 0..2 steps
 ```
+
+TOTP verification uses trusted-context/system time, not a timestamp supplied in credential request JSON.
 
 The component does not provision QR codes, deliver secrets, prevent replay across requests or rate-limit guesses. Those need application/session state.
 
@@ -48,22 +61,22 @@ Validated claims:
 - multiple audiences require `azp`, and any present `azp` must equal the configured primary audience/client ID;
 - non-zero `exp` with optional bounded clock skew;
 - `nbf` when present;
-- `nonce` when the caller supplies an expected nonce.
+- expected `nonce` when the trusted ceremony context supplies one.
 
-The signature is verified before claim values are used for an identity decision.
+The signature is verified before claim values are used for an identity decision. Time validation uses trusted-context/system time.
 
-`clock_skew_seconds` is bounded to 0..300. Isolate mode denies OIDC before token verification and makes no discovery/network call because none exists in this component.
+`clock_skew_seconds` is bounded to 0..300. Trusted isolate mode denies OIDC before token verification and makes no discovery/network call because none exists in this component.
 
 ## WebAuthn / passkey assertion verification
 
 V0.1 verifies assertions for already-registered ECDSA P-256 credentials.
 
-The caller supplies the expected WebAuthn challenge string exactly as it should appear in `clientDataJSON.challenge` (normally base64url encoding of the random challenge bytes).
+The integrating application supplies the expected WebAuthn challenge through trusted ceremony context. The assertion contains authenticator-signed client data; it does not supply the value against which its own challenge is checked.
 
 Validation includes:
 
 - `type == "webauthn.get"`;
-- exact challenge;
+- exact expected challenge from trusted ceremony state;
 - exact origin;
 - `crossOrigin` must not be true;
 - SHA-256 RP ID hash;
@@ -77,10 +90,10 @@ The component does not implement WebAuthn registration, attestation validation, 
 
 ## Break-glass
 
-Break-glass requires exactly two distinct registered keyholder IDs in one attempt. Each supplied secret is verified against its own PBKDF2 record using the same password security floor.
+Break-glass configuration rejects duplicate keyholder IDs. Authentication requires exactly two distinct registered keyholder IDs in one attempt. Each supplied secret is verified against its own PBKDF2 record using the same password security bounds.
 
 The component does not coordinate two humans, deliver challenges, schedule emergency windows or override application authorisation. It only proves that two registered break-glass credentials were supplied together.
 
 ## Upgrade rule
 
-A change to an algorithm, security floor, OIDC claim contract, WebAuthn ceremony or authentication result semantics requires tests, PRD/EDD update, regenerated code-derived evidence and a new release version when externally observable behaviour changes.
+A change to an algorithm, security bound, OIDC claim contract, WebAuthn ceremony or authentication result semantics requires tests, PRD/EDD update, regenerated code-derived evidence and a new release version when externally observable behaviour changes.

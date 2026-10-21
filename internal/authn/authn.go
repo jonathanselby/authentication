@@ -25,6 +25,7 @@ import (
 
 const (
 	MinPBKDF2Iterations     = 600000
+	MaxPBKDF2Iterations     = 2000000
 	MinSaltBytes            = 16
 	PasswordHashBytes       = 32
 	MinTOTPSecretBytes      = 20
@@ -81,7 +82,6 @@ type PasskeyAssertion struct {
 	ClientDataJSON    string `json:"client_data_json"`
 	AuthenticatorData string `json:"authenticator_data"`
 	Signature         string `json:"signature"`
-	Challenge         string `json:"challenge"`
 }
 
 type Request struct {
@@ -90,11 +90,17 @@ type Request struct {
 	Password       string            `json:"password,omitempty"`
 	TOTP           string            `json:"totp,omitempty"`
 	OIDCToken      string            `json:"oidc_token,omitempty"`
-	OIDCNonce      string            `json:"oidc_nonce,omitempty"`
 	Passkey        *PasskeyAssertion `json:"passkey,omitempty"`
 	BreakGlassKeys map[string]string `json:"break_glass_keys,omitempty"`
-	IsolateMode    bool              `json:"isolate_mode,omitempty"`
-	Now            time.Time         `json:"now,omitempty"`
+}
+
+// TrustedContext contains authentication-ceremony state that must not be supplied
+// by the credential request itself.
+type TrustedContext struct {
+	Now              time.Time
+	OIDCNonce        string
+	PasskeyChallenge string
+	IsolateMode      bool
 }
 
 type Result struct {
@@ -110,6 +116,13 @@ type Result struct {
 type PasskeyVerification struct {
 	SignCount      uint32
 	CounterWarning bool
+}
+
+var dummyPasswordRecord = PasswordRecord{
+	UserID:     "_unknown",
+	Salt:       "AAAAAAAAAAAAAAAAAAAAAA==",
+	Iterations: MinPBKDF2Iterations,
+	Hash:       "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
 }
 
 func ValidateConfig(c Config) error {
@@ -144,10 +157,12 @@ func ValidateConfig(c Config) error {
 			return err
 		}
 	}
+	breakGlassSeen := map[string]bool{}
 	for _, b := range c.BreakGlass {
-		if b.UserID == "" {
-			return errors.New("break-glass user_id required")
+		if b.UserID == "" || breakGlassSeen[b.UserID] {
+			return errors.New("invalid or duplicate break-glass keyholder")
 		}
+		breakGlassSeen[b.UserID] = true
 		p := PasswordRecord{UserID: b.UserID, Salt: b.Salt, Iterations: b.Iterations, Hash: b.Hash}
 		if err := validatePasswordRecord(p); err != nil {
 			return err
@@ -170,21 +185,27 @@ func duplicate(seen map[string]string, id, method string) bool {
 	return false
 }
 
-func Authenticate(c Config, r Request) (Result, error) {
+func Authenticate(c Config, r Request, trusted TrustedContext) (Result, error) {
 	if err := ValidateConfig(c); err != nil {
 		return Result{}, err
 	}
-	now := r.Now
+	now := trusted.Now
 	if now.IsZero() {
 		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
 	}
 	deny := func(reason string) (Result, error) {
 		return Result{Authenticated: false, Method: r.Method, Reason: reason}, nil
 	}
 	switch r.Method {
 	case "local":
-		p, ok := findPassword(c.Local, r.UserID)
-		if !ok || !VerifyPassword(p, r.Password) {
+		p, found := findPassword(c.Local, r.UserID)
+		if !found {
+			p = dummyPasswordRecord
+		}
+		valid := VerifyPassword(p, r.Password)
+		if !found || !valid {
 			return deny("credentials rejected")
 		}
 		return Result{Authenticated: true, Subject: r.UserID, Method: r.Method}, nil
@@ -199,23 +220,23 @@ func Authenticate(c Config, r Request) (Result, error) {
 		}
 		return Result{Authenticated: true, Subject: r.UserID, Method: r.Method}, nil
 	case "oidc":
-		if r.IsolateMode {
+		if trusted.IsolateMode {
 			return deny("federation disabled in isolate mode")
 		}
 		if c.OIDC == nil {
 			return deny("OIDC not configured")
 		}
-		sub, err := VerifyOIDC(r.OIDCToken, *c.OIDC, r.OIDCNonce, now)
+		sub, err := VerifyOIDC(r.OIDCToken, *c.OIDC, trusted.OIDCNonce, now)
 		if err != nil {
 			return deny("credentials rejected")
 		}
 		return Result{Authenticated: true, Subject: sub, Method: r.Method}, nil
 	case "passkey":
 		p, ok := findPasskey(c.Passkeys, r.UserID)
-		if !ok || r.Passkey == nil {
+		if !ok || r.Passkey == nil || trusted.PasskeyChallenge == "" {
 			return deny("credentials rejected")
 		}
-		v, err := VerifyPasskey(p, *r.Passkey)
+		v, err := VerifyPasskey(p, *r.Passkey, trusted.PasskeyChallenge)
 		if err != nil {
 			return deny("credentials rejected")
 		}
@@ -236,8 +257,8 @@ func Authenticate(c Config, r Request) (Result, error) {
 }
 
 func PBKDF2Record(user, password string, salt []byte, iterations int) (PasswordRecord, error) {
-	if user == "" || len(salt) < MinSaltBytes || iterations < MinPBKDF2Iterations {
-		return PasswordRecord{}, errors.New("password record parameters below minimum")
+	if user == "" || len(salt) < MinSaltBytes || iterations < MinPBKDF2Iterations || iterations > MaxPBKDF2Iterations {
+		return PasswordRecord{}, errors.New("password record parameters outside supported bounds")
 	}
 	h, err := pbkdf2.Key(sha256.New, password, salt, iterations, PasswordHashBytes)
 	if err != nil {
@@ -252,8 +273,8 @@ func PBKDF2Record(user, password string, salt []byte, iterations int) (PasswordR
 }
 
 func validatePasswordRecord(r PasswordRecord) error {
-	if r.UserID == "" || r.Iterations < MinPBKDF2Iterations {
-		return errors.New("password record below minimum work factor")
+	if r.UserID == "" || r.Iterations < MinPBKDF2Iterations || r.Iterations > MaxPBKDF2Iterations {
+		return errors.New("password record work factor outside supported bounds")
 	}
 	salt, err := base64.StdEncoding.DecodeString(r.Salt)
 	if err != nil || len(salt) < MinSaltBytes {
@@ -412,6 +433,7 @@ func VerifyOIDC(tok string, c OIDCConfig, expectedNonce string, now time.Time) (
 	}
 	return claims.Sub, nil
 }
+
 func validateOIDCConfig(c OIDCConfig) error {
 	if c.Issuer == "" || c.Audience == "" || c.PublicKeyPEM == "" {
 		return errors.New("OIDC issuer, audience and pinned public key are required")
@@ -488,8 +510,8 @@ func parseRSA(s string) (*rsa.PublicKey, error) {
 	return nil, errors.New("invalid or short RSA public key")
 }
 
-func VerifyPasskey(r PasskeyRecord, a PasskeyAssertion) (PasskeyVerification, error) {
-	if r.RPID == "" || r.Origin == "" || a.Challenge == "" {
+func VerifyPasskey(r PasskeyRecord, a PasskeyAssertion, expectedChallenge string) (PasskeyVerification, error) {
+	if r.RPID == "" || r.Origin == "" || expectedChallenge == "" {
 		return PasskeyVerification{}, errors.New("passkey verification parameters missing")
 	}
 	cd, err := base64.RawURLEncoding.DecodeString(a.ClientDataJSON)
@@ -502,7 +524,7 @@ func VerifyPasskey(r PasskeyRecord, a PasskeyAssertion) (PasskeyVerification, er
 		Origin      string `json:"origin"`
 		CrossOrigin bool   `json:"crossOrigin,omitempty"`
 	}
-	if err := json.Unmarshal(cd, &c); err != nil || c.Type != "webauthn.get" || c.Challenge != a.Challenge || c.Origin != r.Origin || c.CrossOrigin {
+	if err := json.Unmarshal(cd, &c); err != nil || c.Type != "webauthn.get" || c.Challenge != expectedChallenge || c.Origin != r.Origin || c.CrossOrigin {
 		return PasskeyVerification{}, errors.New("client data rejected")
 	}
 	ad, err := base64.RawURLEncoding.DecodeString(a.AuthenticatorData)
